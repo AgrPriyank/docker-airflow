@@ -1,0 +1,135 @@
+version: '3'
+#Reference compose file: https://airflow.apache.org/docs/apache-airflow/stable/docker-compose.yaml
+
+x-airflow-common:
+    &airflow-common
+    image: apache/airflow:2.1.0
+    environment:
+        &airflow-common-env
+        AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+        AIRFLOW__CORE__SQL_ALCHEMY_CONN: mysql://airflow:airflow@mysql/airflow
+        AIRFLOW__CELERY__RESULT_BACKEND: db+mysql://airflow:airflow@mysql/airflow
+        AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
+        AIRFLOW__CORE__FERNET_KEY: ''
+        AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+        AIRFLOW__CORE__LOAD_EXAMPLES: 'false'        
+        PYTHONPATH: /opt/airflow/dags/minio/airflow-dags
+        #AIRFLOW__WEBSERVER__BASE_URL: http://localhost:8000/airflow
+        #AIRFLOW__LOGGING__LOGGING_LEVEL: DEBUG
+
+    volumes:
+        - minio-store:/opt/airflow/dags
+        - ./requirements.txt: /opt/airflow
+    depends_on:
+        redis:
+            condition: service_healthy
+        mysql:
+            condition: service_healthy
+    
+services:
+    minio:
+        image: minio/minio:RELEASE.2021-06-09T18-51-39Z
+        volumes:
+            - minio-store:/data
+        ports:
+            - "9100:9000"
+        environment:
+            - MINIO_ROOT_USER=minio
+            - MINIO_ROOT_PASSWORD=minio
+        command: server /data/minio/
+        
+    minio-cli:
+        image: minio/mc
+        depends_on:
+            - minio
+        entrypoint: >
+            /bin/sh -c "
+            /usr/bin/mc config host add airflow-minio http://minio:9000 minio minio;
+            /usr/bin/mc rm -r --force airflow-minio/airflow-tasks;
+            /usr/bin/mc mb airflow-minio/airflow-dags;
+            /usr/bin/mc mb airflow-minio/airflow-tasks;
+            exit 0;
+            "
+            
+    redis:
+        image: redis:6.2.4
+        healthcheck:
+            test: ["CMD", "redis-cli", "ping"]
+            interval: 5s
+            timeout: 30s
+            retries: 50
+        restart: always
+        # command: redis-server --requirepass redispass
+
+    mysql:
+        image: mysql:8.0
+        restart: always
+        ports:
+            - 3306:3306
+        cap_add:
+            - SYS_NICE  # CAP_SYS_NICE
+        volumes:
+            - mysql-db-volume:/var/lib/mysql
+        environment:
+            - MYSQL_ROOT_PASSWORD=Iso*help
+            - MYSQL_USER=airflow
+            - MYSQL_PASSWORD=airflow
+            - MYSQL_DATABASE=airflow
+        healthcheck:
+            test: ["CMD", "mysqladmin" ,"ping", "-h", "localhost", '-u', 'airflow', '-pairflow' ]
+            timeout: 20s
+            retries: 10
+        
+            
+    airflow-init:
+        <<: *airflow-common
+        command: version
+        environment:
+            <<: *airflow-common-env
+            _AIRFLOW_DB_UPGRADE: 'true'
+            _AIRFLOW_WWW_USER_CREATE: 'false'
+            _AIRFLOW_WWW_USER_USERNAME: 'airflow'
+            _AIRFLOW_WWW_USER_PASSWORD: 'airflow'
+
+    webserver:
+        <<: *airflow-common
+        ports:
+            - "9089:8080"
+        command: bash -c "pip install -r /opt/airflow/requirements.txt && airflow db init && airflow webserver"
+        restart: always
+        environment:
+            <<: *airflow-common-env
+            AIRFLOW_USER_REGISTRATION_ROLE : 'VIEWER'
+        healthcheck:
+            test: ["CMD-SHELL", "[ -f /opt/airflow/airflow-webserver.pid ]"]
+            interval: 60s
+            timeout: 60s
+            retries: 3
+
+    flower:
+        <<: *airflow-common
+        restart: always
+        ports:
+            - "5555:5555"
+        command: celery flower
+
+    scheduler:
+        <<: *airflow-common
+        restart: always
+        depends_on:
+            - webserver
+            - airflow-init
+            - mysql
+        command: bash -c "pip install -r /opt/airflow/requirements.txt; airflow scheduler"
+
+    worker:
+        <<: *airflow-common
+        restart: always
+        depends_on:
+            - scheduler
+            - mysql
+        command: bash -c "pip install -r /opt/airflow/requirements.txt; airflow celery worker"
+        
+volumes:
+    mysql-db-volume:
+    minio-store:
